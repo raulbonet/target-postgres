@@ -92,72 +92,27 @@ class PostgresConnector(SQLConnector):
         """
         return self.config.get("interpret_content_encoding", False)
 
-    def prepare_table(  # type: ignore[override]
+    def get_table_from_metadata(
         self,
         full_table_name: str,
-        schema: dict,
-        primary_keys: t.Sequence[str],
-        connection: sa.engine.Connection,
-        partition_keys: list[str] | None = None,
-        as_temp_table: bool = False,
     ) -> sa.Table:
-        """Adapt target table to provided schema if possible.
+        """Returns an existing table object from the database.
 
         Args:
-            full_table_name: the target table name.
-            schema: the JSON Schema for the table.
-            primary_keys: list of key properties.
-            connection: the database connection.
-            partition_keys: list of partition keys.
-            as_temp_table: True to create a temp table.
+            full_table_name: the fully qualified table name.
 
         Returns:
             The table object.
         """
         _, schema_name, table_name = self.parse_full_table_name(full_table_name)
         meta = sa.MetaData(schema=schema_name)
-        table: sa.Table
-        if not self.table_exists(full_table_name=full_table_name):
-            table = self.create_empty_table(
-                table_name=table_name,
-                meta=meta,
-                schema=schema,
-                primary_keys=primary_keys,
-                partition_keys=partition_keys,
-                as_temp_table=as_temp_table,
-                connection=connection,
-            )
-            return table
-        meta.reflect(connection, only=[table_name])
-        table = meta.tables[
-            full_table_name
-        ]  # So we don't mess up the casing of the Table reference
-
-        columns = self.get_table_columns(
-            schema_name=cast(str, schema_name),
-            table_name=table_name,
-            connection=connection,
-        )
-
-        for property_name, property_def in schema["properties"].items():
-            column_object = None
-            if property_name in columns:
-                column_object = columns[property_name]
-            self.prepare_column(
-                full_table_name=table.fullname,
-                column_name=property_name,
-                sql_type=self.to_sql_type(property_def),
-                connection=connection,
-                column_object=column_object,
-            )
-
+        meta.reflect(bind=self._engine, only=[table_name])
         return meta.tables[full_table_name]
 
     def copy_table_structure(
         self,
         full_table_name: str,
         from_table: sa.Table,
-        connection: sa.engine.Connection,
         as_temp_table: bool = False,
     ) -> sa.Table:
         """Copy table structure.
@@ -165,7 +120,6 @@ class PostgresConnector(SQLConnector):
         Args:
             full_table_name: the target table name potentially including schema
             from_table: the  source table
-            connection: the database connection.
             as_temp_table: True to create a temp table.
 
         Returns:
@@ -181,11 +135,11 @@ class PostgresConnector(SQLConnector):
             columns.append(column._copy())
         if as_temp_table:
             new_table = sa.Table(table_name, meta, *columns, prefixes=["TEMPORARY"])
-            new_table.create(bind=connection)
+            new_table.create(bind=self._engine)
             return new_table
         else:
             new_table = sa.Table(table_name, meta, *columns)
-            new_table.create(bind=connection)
+            new_table.create(bind=self._engine)
             return new_table
 
     @contextmanager
@@ -193,13 +147,11 @@ class PostgresConnector(SQLConnector):
         with self._engine.connect().execution_options() as conn:
             yield conn
 
-    def drop_table(self, table: sa.Table, connection: sa.engine.Connection):
+    def drop_table(self, table: sa.Table):
         """Drop table data."""
-        table.drop(bind=connection)
+        table.drop(bind=self._engine)
 
-    def clone_table(
-        self, new_table_name, table, metadata, connection, temp_table
-    ) -> sa.Table:
+    def clone_table(self, new_table_name, table, metadata, temp_table) -> sa.Table:
         """Clone a table."""
         new_columns = []
         for column in table.columns:
@@ -215,7 +167,7 @@ class PostgresConnector(SQLConnector):
             )
         else:
             new_table = sa.Table(new_table_name, metadata, *new_columns)
-        new_table.create(bind=connection)
+        new_table.create(bind=self._engine)
         return new_table
 
     def to_sql_type(self, jsonschema_type: dict) -> sa.types.TypeEngine:  # type: ignore[override]
@@ -331,10 +283,8 @@ class PostgresConnector(SQLConnector):
 
     def create_empty_table(  # type: ignore[override]
         self,
-        table_name: str,
-        meta: sa.MetaData,
+        full_table_name: str,
         schema: dict,
-        connection: sa.engine.Connection,
         primary_keys: t.Sequence[str] | None = None,
         partition_keys: list[str] | None = None,
         as_temp_table: bool = False,
@@ -342,10 +292,9 @@ class PostgresConnector(SQLConnector):
         """Create an empty target table.
 
         Args:
-            table_name: the target table name.
+            full_table_name: the target table name.
             meta: the SQLAchemy metadata object.
             schema: the JSON schema for the new table.
-            connection: the database connection.
             primary_keys: list of key properties.
             partition_keys: list of partition keys.
             as_temp_table: True to create a temp table.
@@ -357,6 +306,8 @@ class PostgresConnector(SQLConnector):
             NotImplementedError: if temp tables are unsupported and as_temp_table=True.
             RuntimeError: if a variant schema is passed with no properties defined.
         """
+        _, schema_name, table_name = self.parse_full_table_name(full_table_name)
+        meta = sa.MetaData(schema=schema_name)
         columns: list[sa.Column] = []
         primary_keys = primary_keys or []
         try:
@@ -379,97 +330,16 @@ class PostgresConnector(SQLConnector):
             )
         if as_temp_table:
             new_table = sa.Table(table_name, meta, *columns, prefixes=["TEMPORARY"])
-            new_table.create(bind=connection)
+            new_table.create(bind=self._engine)
             return new_table
 
         new_table = sa.Table(table_name, meta, *columns)
-        new_table.create(bind=connection)
+        new_table.create(bind=self._engine)
         return new_table
-
-    def prepare_column(
-        self,
-        full_table_name: str,
-        column_name: str,
-        sql_type: sa.types.TypeEngine,
-        connection: sa.engine.Connection | None = None,
-        column_object: sa.Column | None = None,
-    ) -> None:
-        """Adapt target table to provided schema if possible.
-
-        Args:
-            full_table_name: the fully qualified table name.
-            column_name: the target column name.
-            sql_type: the SQLAlchemy type.
-            connection: a database connection. optional.
-            column_object: a SQLAlchemy column. optional.
-        """
-        if connection is None:
-            super().prepare_column(full_table_name, column_name, sql_type)
-            return
-
-        _, schema_name, table_name = self.parse_full_table_name(full_table_name)
-
-        column_exists = column_object is not None or self.column_exists(
-            full_table_name, column_name, connection=connection
-        )
-
-        if not column_exists:
-            self._create_empty_column(
-                # We should migrate every function to use sa.Table
-                # instead of having to know what the function wants
-                table_name=table_name,
-                column_name=column_name,
-                sql_type=sql_type,
-                schema_name=cast(str, schema_name),
-                connection=connection,
-            )
-            return
-
-        self._adapt_column_type(
-            schema_name=cast(str, schema_name),
-            table_name=table_name,
-            column_name=column_name,
-            sql_type=sql_type,
-            connection=connection,
-            column_object=column_object,
-        )
-
-    def _create_empty_column(  # type: ignore[override]
-        self,
-        schema_name: str,
-        table_name: str,
-        column_name: str,
-        sql_type: sa.types.TypeEngine,
-        connection: sa.engine.Connection,
-    ) -> None:
-        """Create a new column.
-
-        Args:
-            schema_name: The schema name.
-            table_name: The table name.
-            column_name: The name of the new column.
-            sql_type: SQLAlchemy type engine to be used in creating the new column.
-            connection: The database connection.
-
-        Raises:
-            NotImplementedError: if adding columns is not supported.
-        """
-        if not self.allow_column_add:
-            msg = "Adding columns is not supported."
-            raise NotImplementedError(msg)
-
-        column_add_ddl = self.get_column_add_ddl(
-            schema_name=schema_name,
-            table_name=table_name,
-            column_name=column_name,
-            column_type=sql_type,
-        )
-        connection.execute(column_add_ddl)
 
     def get_column_add_ddl(  # type: ignore[override]
         self,
         table_name: str,
-        schema_name: str,
         column_name: str,
         column_type: sa.types.TypeEngine,
     ) -> sa.DDL:
@@ -484,6 +354,7 @@ class PostgresConnector(SQLConnector):
         Returns:
             A sqlalchemy DDL instance.
         """
+        _, schema_name, table_name = self.parse_full_table_name(table_name)
         column = sa.Column(column_name, column_type)
 
         return sa.DDL(
@@ -498,76 +369,6 @@ class PostgresConnector(SQLConnector):
                 "column_type": column.type.compile(dialect=self._engine.dialect),
             },
         )
-
-    def _adapt_column_type(  # type: ignore[override]
-        self,
-        schema_name: str,
-        table_name: str,
-        column_name: str,
-        sql_type: sa.types.TypeEngine,
-        connection: sa.engine.Connection,
-        column_object: sa.Column | None,
-    ) -> None:
-        """Adapt table column type to support the new JSON schema type.
-
-        Args:
-            schema_name: The schema name.
-            table_name: The table name.
-            column_name: The target column name.
-            sql_type: The new SQLAlchemy type.
-            connection: The database connection.
-            column_object: The existing column object.
-
-        Raises:
-            NotImplementedError: if altering columns is not supported.
-        """
-        current_type: sa.types.TypeEngine
-        if column_object is not None:
-            current_type = t.cast(sa.types.TypeEngine, column_object.type)
-        else:
-            current_type = self._get_column_type(
-                schema_name=schema_name,
-                table_name=table_name,
-                column_name=column_name,
-                connection=connection,
-            )
-
-        # remove collation if present and save it
-        current_type_collation = self.remove_collation(current_type)
-
-        # Check if the existing column type and the sql type are the same
-        if str(sql_type) == str(current_type):
-            # The current column and sql type are the same
-            # Nothing to do
-            return
-
-        # Not the same type, generic type or compatible types
-        # calling merge_sql_types for assistnace
-        compatible_sql_type = self.merge_sql_types([current_type, sql_type])
-
-        if str(compatible_sql_type) == str(current_type):
-            # Nothing to do
-            return
-
-        # Put the collation level back before altering the column
-        if current_type_collation:
-            self.update_collation(compatible_sql_type, current_type_collation)
-
-        if not self.allow_column_alter:
-            msg = (
-                "Altering columns is not supported. Could not convert column "
-                f"'{schema_name}.{table_name}.{column_name}' from '{current_type}' to "
-                f"'{compatible_sql_type}'."
-            )
-            raise NotImplementedError(msg)
-
-        alter_column_ddl = self.get_column_alter_ddl(
-            schema_name=schema_name,
-            table_name=table_name,
-            column_name=column_name,
-            column_type=compatible_sql_type,
-        )
-        connection.execute(alter_column_ddl)
 
     def get_column_alter_ddl(  # type: ignore[override]
         self,
@@ -735,99 +536,6 @@ class PostgresConnector(SQLConnector):
             frame: The current stack frame
         """
         exit(1)  # Calling this to be sure atexit is called, so clean_up gets called
-
-    def _get_column_type(  # type: ignore[override]
-        self,
-        schema_name: str,
-        table_name: str,
-        column_name: str,
-        connection: sa.engine.Connection,
-    ) -> sa.types.TypeEngine:
-        """Get the SQL type of the declared column.
-
-        Args:
-            schema_name: The schema name.
-            table_name: The table name.
-            column_name: The name of the column.
-            connection: The database connection.
-
-        Returns:
-            The type of the column.
-
-        Raises:
-            KeyError: If the provided column name does not exist.
-        """
-        try:
-            column = self.get_table_columns(
-                schema_name=schema_name,
-                table_name=table_name,
-                connection=connection,
-            )[column_name]
-        except KeyError as ex:
-            msg = (
-                f"Column `{column_name}` does not exist in table"
-                "`{schema_name}.{table_name}`."
-            )
-            raise KeyError(msg) from ex
-
-        return t.cast(sa.types.TypeEngine, column.type)
-
-    def get_table_columns(  # type: ignore[override]
-        self,
-        schema_name: str,
-        table_name: str,
-        connection: sa.engine.Connection,
-        column_names: list[str] | None = None,
-    ) -> dict[str, sa.Column]:
-        """Return a list of table columns.
-
-        Overrode to support schema_name
-
-        Args:
-            schema_name: schema name.
-            table_name: table name to get columns for.
-            connection: database connection.
-            column_names: A list of column names to filter to.
-
-        Returns:
-            An ordered list of column objects.
-        """
-        inspector = sa.inspect(connection)
-        columns = inspector.get_columns(table_name, schema_name)
-
-        return {
-            col_meta["name"]: sa.Column(
-                col_meta["name"],
-                col_meta["type"],
-                nullable=col_meta.get("nullable", False),
-            )
-            for col_meta in columns
-            if not column_names
-            or col_meta["name"].casefold() in {col.casefold() for col in column_names}
-        }
-
-    def column_exists(  # type: ignore[override]
-        self,
-        full_table_name: str,
-        column_name: str,
-        connection: sa.engine.Connection,
-    ) -> bool:
-        """Determine if the target column already exists.
-
-        Args:
-            full_table_name: the target table name.
-            column_name: the target column name.
-            connection: the database connection.
-
-        Returns:
-            True if table exists, False if not.
-        """
-        _, schema_name, table_name = self.parse_full_table_name(full_table_name)
-        assert schema_name is not None
-        assert table_name is not None
-        return column_name in self.get_table_columns(
-            schema_name=schema_name, table_name=table_name, connection=connection
-        )
 
 
 class NOTYPE(TypeDecorator):

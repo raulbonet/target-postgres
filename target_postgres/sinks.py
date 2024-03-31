@@ -53,14 +53,12 @@ class PostgresSink(SQLSink):
             self.append_only = False
         if self.schema_name:
             self.connector.prepare_schema(self.schema_name)
-        with self.connector._connect() as connection, connection.begin():
-            self.connector.prepare_table(
-                full_table_name=self.full_table_name,
-                schema=self.schema,
-                primary_keys=self.key_properties,
-                connection=connection,
-                as_temp_table=False,
-            )
+        self.connector.prepare_table(
+            full_table_name=self.full_table_name,
+            schema=self.schema,
+            primary_keys=self.key_properties,
+            as_temp_table=False,
+        )
 
     def process_batch(self, context: dict) -> None:
         """Process a batch with the given batch context.
@@ -71,41 +69,39 @@ class PostgresSink(SQLSink):
         Args:
             context: Stream partition or context dictionary.
         """
-        # Use one connection so we do this all in a single transaction
-        with self.connector._connect() as connection, connection.begin():
-            # Check structure of table
-            table: sa.Table = self.connector.prepare_table(
-                full_table_name=self.full_table_name,
-                schema=self.schema,
-                primary_keys=self.key_properties,
-                as_temp_table=False,
-                connection=connection,
-            )
-            # Create a temp table (Creates from the table above)
-            temp_table: sa.Table = self.connector.copy_table_structure(
-                full_table_name=self.temp_table_name,
-                from_table=table,
-                as_temp_table=True,
-                connection=connection,
-            )
-            # Insert into temp table
-            self.bulk_insert_records(
-                table=temp_table,
-                schema=self.schema,
-                primary_keys=self.key_properties,
-                records=context["records"],
-                connection=connection,
-            )
-            # Merge data from Temp table to main table
-            self.upsert(
-                from_table=temp_table,
-                to_table=table,
-                schema=self.schema,
-                join_keys=self.key_properties,
-                connection=connection,
-            )
-            # Drop temp table
-            self.connector.drop_table(table=temp_table, connection=connection)
+        # Check structure of table
+        table: sa.Table = self.connector.get_table_from_metadata(self.full_table_name)
+
+        # Create a temp table (Creates from the table above)
+        temp_table: sa.Table = self.connector.copy_table_structure(
+            full_table_name=self.connector.get_fully_qualified_name(
+                table_name=self.temp_table_name,
+                schema_name=self.schema_name,
+                db_name=self.database_name,
+            ),
+            from_table=table,
+            as_temp_table=False,
+        )
+        # Insert into temp table
+        self.bulk_insert_records(
+            full_table_name=self.connector.get_fully_qualified_name(
+                table_name=self.temp_table_name,
+                schema_name=self.schema_name,
+                db_name=self.database_name,
+            ),
+            schema=self.schema,
+            primary_keys=self.key_properties,
+            records=context["records"],
+        )
+        # Merge data from Temp table to main table
+        self.upsert(
+            from_table=temp_table,
+            to_table=table,
+            schema=self.schema,
+            join_keys=self.key_properties,
+        )
+        # Drop temp table
+        self.connector.drop_table(table=temp_table)
 
     def generate_temp_table_name(self):
         """Uuid temp table name."""
@@ -118,11 +114,10 @@ class PostgresSink(SQLSink):
 
     def bulk_insert_records(  # type: ignore[override]
         self,
-        table: sa.Table,
+        full_table_name: str,
         schema: dict,
         records: Iterable[Dict[str, Any]],
         primary_keys: Sequence[str],
-        connection: sa.engine.Connection,
     ) -> Optional[int]:
         """Bulk insert records to an existing destination table.
 
@@ -131,7 +126,7 @@ class PostgresSink(SQLSink):
         faster, native bulk uploads.
 
         Args:
-            table: the target table object.
+            full_table_name: the target table object.
             schema: the JSON schema for the new table, to be used when inferring column
                 names.
             records: the input records.
@@ -145,7 +140,7 @@ class PostgresSink(SQLSink):
         insert: str = cast(
             str,
             self.generate_insert_statement(
-                table.name,
+                full_table_name,
                 columns,
             ),
         )
@@ -170,7 +165,10 @@ class PostgresSink(SQLSink):
                 for column in columns:
                     insert_record[column.name] = record.get(column.name)
                 data_to_insert.append(insert_record)
-        connection.execute(insert, data_to_insert)
+
+        with self.connector._connect() as conn, conn.begin():
+            conn.execute(insert, data_to_insert)
+
         return True
 
     def upsert(
@@ -179,7 +177,6 @@ class PostgresSink(SQLSink):
         to_table: sa.Table,
         schema: dict,
         join_keys: Sequence[str],
-        connection: sa.engine.Connection,
     ) -> Optional[int]:
         """Merge upsert data from one table to another.
 
@@ -195,52 +192,53 @@ class PostgresSink(SQLSink):
             report number of records affected/inserted.
 
         """
-        if self.append_only is True:
-            # Insert
-            select_stmt = sa.select(from_table.columns).select_from(from_table)
-            insert_stmt = to_table.insert().from_select(
-                names=from_table.columns, select=select_stmt
-            )
-            connection.execute(insert_stmt)
-        else:
-            join_predicates = []
-            to_table_key: sa.Column
-            for key in join_keys:
-                from_table_key: sa.Column = from_table.columns[key]
-                to_table_key = to_table.columns[key]
-                join_predicates.append(from_table_key == to_table_key)
+        with self.connector._connect() as connection, connection.begin():
+            if self.append_only is True:
+                # Insert
+                select_stmt = sa.select(from_table.columns).select_from(from_table)
+                insert_stmt = to_table.insert().from_select(
+                    names=from_table.columns, select=select_stmt
+                )
+                connection.execute(insert_stmt)
+            else:
+                join_predicates = []
+                to_table_key: sa.Column
+                for key in join_keys:
+                    from_table_key: sa.Column = from_table.columns[key]
+                    to_table_key = to_table.columns[key]
+                    join_predicates.append(from_table_key == to_table_key)
 
-            join_condition = sa.and_(*join_predicates)
+                join_condition = sa.and_(*join_predicates)
 
-            where_predicates = []
-            for key in join_keys:
-                to_table_key = to_table.columns[key]
-                where_predicates.append(to_table_key.is_(None))
-            where_condition = sa.and_(*where_predicates)
+                where_predicates = []
+                for key in join_keys:
+                    to_table_key = to_table.columns[key]
+                    where_predicates.append(to_table_key.is_(None))
+                where_condition = sa.and_(*where_predicates)
 
-            select_stmt = (
-                sa.select(from_table.columns)
-                .select_from(from_table.outerjoin(to_table, join_condition))
-                .where(where_condition)
-            )
-            insert_stmt = sa.insert(to_table).from_select(
-                names=from_table.columns, select=select_stmt
-            )
+                select_stmt = (
+                    sa.select(from_table.columns)
+                    .select_from(from_table.outerjoin(to_table, join_condition))
+                    .where(where_condition)
+                )
+                insert_stmt = sa.insert(to_table).from_select(
+                    names=from_table.columns, select=select_stmt
+                )
 
-            connection.execute(insert_stmt)
+                connection.execute(insert_stmt)
 
-            # Update
-            where_condition = join_condition
-            update_columns = {}
-            for column_name in self.schema["properties"].keys():
-                from_table_column: sa.Column = from_table.columns[column_name]
-                to_table_column: sa.Column = to_table.columns[column_name]
-                update_columns[to_table_column] = from_table_column
+                # Update
+                where_condition = join_condition
+                update_columns = {}
+                for column_name in self.schema["properties"].keys():
+                    from_table_column: sa.Column = from_table.columns[column_name]
+                    to_table_column: sa.Column = to_table.columns[column_name]
+                    update_columns[to_table_column] = from_table_column
 
-            update_stmt = (
-                sa.update(to_table).where(where_condition).values(update_columns)
-            )
-            connection.execute(update_stmt)
+                update_stmt = (
+                    sa.update(to_table).where(where_condition).values(update_columns)
+                )
+                connection.execute(update_stmt)
 
         return None
 
@@ -273,8 +271,11 @@ class PostgresSink(SQLSink):
         Returns:
             An insert statement.
         """
-        metadata = sa.MetaData()
-        table = sa.Table(full_table_name, metadata, *columns)
+        _, schema_name, table_name = self.connector.parse_full_table_name(
+            full_table_name
+        )
+        metadata = sa.MetaData(schema=schema_name)
+        table = sa.Table(table_name, metadata, *columns)
         return sa.insert(table)
 
     def conform_name(self, name: str, object_type: Optional[str] = None) -> str:
@@ -338,7 +339,6 @@ class PostgresSink(SQLSink):
             if not self.connector.column_exists(
                 full_table_name=self.full_table_name,
                 column_name=self.version_column_name,
-                connection=connection,
             ):
                 raise RuntimeError(
                     f"{self.version_column_name} is required for activate version "
@@ -349,7 +349,6 @@ class PostgresSink(SQLSink):
                 or self.connector.column_exists(
                     full_table_name=self.full_table_name,
                     column_name=self.soft_delete_column_name,
-                    connection=connection,
                 )
             ):
                 raise RuntimeError(
